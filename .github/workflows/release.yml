@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Match the versions pinned in ci.yml.
+  NODE_VERSION: 22
+  PNPM_VERSION: 11.19.0
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS arm64
+            os: macos-15
+            # ponytail: arm64 only, matching the existing v1.2.2 macOS asset.
+            # Add x64/universal later via a second matrix entry + notarization.
+            target: --mac
+            artifacts: |
+              dist/*.dmg
+              dist/*.zip
+          - label: Windows x64
+            os: windows-latest
+            target: --win portable nsis
+            artifacts: |
+              dist/Hearthwright-*.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Package
+        # --publish never keeps electron-builder from uploading to GitHub
+        # Releases during the build step; assets are uploaded in the release job.
+        run: pnpm build && electron-builder ${{ matrix.target }} --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: ${{ matrix.artifacts }}
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*'
+          merge-multiple: true
+          path: dist
+      - name: Generate checksums
+        run: |
+          cd dist
+          for f in *.dmg *.zip *.exe; do [ -e "$f" ] && sha256sum "$f" > "$f".sha256; done
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --repo "$REPO"
+          else
+            gh release create "$TAG" dist/* --repo "$REPO" --generate-notes
+          fi
